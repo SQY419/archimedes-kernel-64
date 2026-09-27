@@ -140,6 +140,23 @@ static void check_violation(void)
 	axi_id = (master_id >> 3) & 0x1FFF;
 	master_name = id2name(axi_id, port_id);
 
+	/*
+	 * MT6761 retail LK leaves a stale M0 read record in the small
+	 * mrdump/minirdump tail (0x47d80000..0x47d8ffff).  When the
+	 * CCCI modem path is enabled, EMI probes before CCCI init and
+	 * reports that record as a live violation; aee_kernel_exception
+	 * then panics before /dev/ccci* can be registered.  Clear only
+	 * this known boot-time record; real Wi-Fi/CCCI violations still
+	 * follow the normal AEE path.
+	 */
+	if (master_id == 0x160 && wr_vio == 2 &&
+		vio_addr >= 0x47d80000ULL && vio_addr < 0x47d90000ULL) {
+		pr_info("[MPU] ignoring stale MT6761 LK M0 read at 0x%llx\n",
+			vio_addr);
+		clear_violation();
+		return;
+	}
+
 #ifdef CONFIG_MTK_DEVMPU
 	/* if is hyperviosr MPU violation, deliver to DevMPU */
 	hp_wr_vio = (mput_2nd >> 21) & 0x3;
