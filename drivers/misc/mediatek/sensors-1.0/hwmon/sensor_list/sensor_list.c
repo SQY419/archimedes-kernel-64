@@ -124,6 +124,15 @@ static void sensorlist_get_deviceinfo(struct work_struct *work)
 		err = sensor_set_cmd_to_hub(sensor,
 			CUST_ACTION_GET_SENSOR_INFO, &devinfo);
 		if (err < 0) {
+#ifdef CONFIG_MTK_CM3232
+			if (sensor == ID_LIGHT || sensor == ID_PROXIMITY) {
+				spin_lock(&sensorlist_info_lock);
+				strlcpy(sensorlist_info[handle].name,
+					sensor == ID_LIGHT ? "CM3232" : "CM3232_PS",
+					sizeof(sensorlist_info[handle].name));
+				spin_unlock(&sensorlist_info_lock);
+			}
+#endif
 			pr_err("sensor(%d) not register\n", sensor);
 			continue;
 		}

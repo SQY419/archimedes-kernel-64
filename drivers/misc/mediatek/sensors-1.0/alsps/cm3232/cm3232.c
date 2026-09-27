@@ -79,6 +79,17 @@ static int cm3232_get_raw_data(int *value)
 	ret = cm3232_read_raw(cm3232_obj, &raw); if (ret < 0) return ret;
 	cm3232_obj->raw = raw; *value = raw; return 0;
 }
+static int cm3232_ps_open_report_data(int open) { return 0; }
+static int cm3232_ps_enable_nodata(int en) { return 0; }
+static int cm3232_ps_set_delay(u64 ns) { return 0; }
+static int cm3232_ps_batch(int flag, int64_t period, int64_t latency)
+{ return cm3232_ps_set_delay(period); }
+static int cm3232_ps_flush(void) { return ps_flush_report(); }
+static int cm3232_ps_get_data(int *value, int *status)
+{
+	/* CM3232 is ALS-only; register the PS endpoint for HAL compatibility. */
+	return -ENODEV;
+}
 static const struct of_device_id cm3232_of_match[] = {
 	{ .compatible = "mediatek,alsps" }, { }
 };
@@ -110,6 +121,20 @@ static int cm3232_i2c_probe(struct i2c_client *client, const struct i2c_device_i
 	ret = als_register_control_path(&ctl); if (ret < 0) goto err_obj;
 	data.get_data = cm3232_get_data; data.als_get_raw_data = cm3232_get_raw_data; data.vender_div = 1;
 	ret = als_register_data_path(&data); if (ret < 0) goto err_obj;
+	{
+		struct ps_control_path ps_ctl = {0};
+		struct ps_data_path ps_data = {0};
+		ps_ctl.open_report_data = cm3232_ps_open_report_data;
+		ps_ctl.enable_nodata = cm3232_ps_enable_nodata;
+		ps_ctl.set_delay = cm3232_ps_set_delay;
+		ps_ctl.batch = cm3232_ps_batch;
+		ps_ctl.flush = cm3232_ps_flush;
+		ps_ctl.is_report_input_direct = false;
+		ps_ctl.is_support_batch = false;
+		ret = ps_register_control_path(&ps_ctl); if (ret < 0) goto err_obj;
+		ps_data.get_data = cm3232_ps_get_data; ps_data.vender_div = 1;
+		ret = ps_register_data_path(&ps_data); if (ret < 0) goto err_obj;
+	}
 	pr_info("probe ok on i2c-%d addr 0x%02x, id 0x%02x\n", client->adapter->nr, client->addr, chip_id & 0xff);
 	return 0;
 err_obj: cm3232_obj = NULL;
