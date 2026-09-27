@@ -18,6 +18,7 @@
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/printk.h>
 #include <mt-plat/sync_write.h>
 #include <mt-plat/mtk_io.h>
@@ -423,10 +424,70 @@ DRIVER_ATTR(mpu_config, 0644, mpu_show, mpu_store);
 static void protect_ap_region(void)
 {
 	struct emi_region_info_t region_info;
+	unsigned long long dram_start;
+	unsigned long long dram_end;
+#ifdef CONFIG_OF
+	unsigned long long wifi_start;
+	unsigned long long wifi_end;
+#endif
 
-	region_info.start = (unsigned long long)DRAM_OFFSET;
-	region_info.end = (unsigned long long)DRAM_OFFSET +
-		get_max_DRAM_size();
+	dram_start = (unsigned long long)DRAM_OFFSET;
+	dram_end = dram_start + get_max_DRAM_size() - 1;
+
+#ifdef CONFIG_OF
+	/*
+	 * Region 31 is the AP catch-all. Split it around the Wi-Fi reserved
+	 * window so region 29 can grant CONNSYS access without opening all
+	 * DRAM to the Wi-Fi domain. Region 30 protects the upper tail.
+	 */
+	wifi_start = 0;
+	wifi_end = 0;
+#ifdef CONFIG_OF_RESERVED_MEM
+	{
+		int i;
+		struct reserved_mem *rmem;
+
+		for (i = 0; i < get_reserved_mem_count(); i++) {
+			rmem = get_reserved_mem(i);
+			if (rmem && rmem->name &&
+			    !strcmp(rmem->name, "wifi-reserve-memory")) {
+				wifi_start = (unsigned long long)rmem->base;
+				wifi_end = wifi_start +
+					   (unsigned long long)rmem->size - 1;
+				break;
+			}
+		}
+	}
+#endif
+	/* The MT6761 target allocates this DT node late; keep an early
+	 * fallback so the AP catch-all is split before CONNSYS starts. */
+	if (wifi_start == 0 || wifi_end <= wifi_start) {
+		wifi_start = 0x7f000000ULL;
+		wifi_end = wifi_start + 0x300000ULL - 1;
+		pr_info("[MPU] Wi-Fi reserved fallback: 0x%llx-0x%llx\n",
+			wifi_start, wifi_end);
+	} else {
+		pr_info("[MPU] Wi-Fi reserved DT: 0x%llx-0x%llx\n",
+			wifi_start, wifi_end);
+	}
+	if (wifi_start > dram_start && wifi_end < dram_end) {
+		region_info.region = AP_REGION_ID;
+		region_info.start = dram_start;
+		region_info.end = wifi_start - 1;
+		set_ap_region_permission(region_info.apc);
+		emi_mpu_set_protection(&region_info);
+
+		region_info.region = AP_REGION_ID - 1;
+		region_info.start = wifi_end + 1;
+		region_info.end = dram_end;
+		set_ap_region_permission(region_info.apc);
+		emi_mpu_set_protection(&region_info);
+		return;
+	}
+#endif
+
+	region_info.start = dram_start;
+	region_info.end = dram_end;
 	region_info.region = AP_REGION_ID;
 	set_ap_region_permission(region_info.apc);
 
