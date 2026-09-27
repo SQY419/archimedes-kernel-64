@@ -1373,7 +1373,7 @@ static void ccmni_queue_state_callback(int md_id, int ccmni_idx,
 	case RX_IRQ:
 		mod_timer(ccmni->timer, jiffies + HZ);
 		napi_schedule(ccmni->napi);
-		wake_lock_timeout(&ctlb->ccmni_wakelock, HZ);
+		__pm_wakeup_event(&ctlb->ccmni_wakelock, jiffies_to_msecs(HZ));
 		break;
 #endif
 
