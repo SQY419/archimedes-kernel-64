@@ -80,6 +80,9 @@ static int SetDcCompenSation(bool enable);
 #endif
 static void Voice_Amp_Change(bool enable);
 static void Speaker_Amp_Change(bool enable);
+/* AW87329 external speaker amplifier hooks. */
+extern unsigned char aw87329_audio_kspk(void);
+extern unsigned char aw87329_audio_off(void);
 static struct mt6357_codec_priv *mCodec_data;
 static unsigned int mBlockSampleRate[AUDIO_ANALOG_DEVICE_INOUT_MAX] = {
 	48000, 48000, 48000};
@@ -3466,8 +3469,10 @@ static void Ext_Speaker_Amp_Change(bool enable)
 		/*udelay(1000); */
 		usleep_range(1 * 1000, 2 * 1000);
 		AudDrv_GPIO_EXTAMP_Select(true, 3);
+                aw87329_audio_kspk();
 		usleep_range(5 * 1000, 10 * 1000);
 	} else {
+                aw87329_audio_off();
 		AudDrv_GPIO_EXTAMP_Select(false, 3);
 		udelay(500);
 	}
