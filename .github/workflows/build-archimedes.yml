@@ -1,0 +1,76 @@
+name: Archimedes kernel builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, kernelsu]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libelf-dev libssl-dev \
+            device-tree-compiler gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            python3 cpio
+
+      - name: Build pure kernel
+        env:
+          JOBS: 24
+          OUT: ${{ runner.temp }}/archimedes-pure
+          KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
+        run: ./build_archimedes.sh pure
+
+      - name: Build KernelSU kernel
+        if: ${{ hashFiles('drivers/kernelsu/Kconfig') != '' }}
+        env:
+          JOBS: 24
+          OUT: ${{ runner.temp }}/archimedes-ksu
+          KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
+        run: ./build_archimedes.sh ksu
+
+      - name: Package boot images
+        env:
+          PURE_OUT: ${{ runner.temp }}/archimedes-pure
+          KSU_OUT: ${{ runner.temp }}/archimedes-ksu
+        run: |
+          python3 tools/package_archimedes_boot.py \
+            --template tools/archimedes-boot-template-32MiB.img \
+            --kernel "$PURE_OUT/arch/arm64/boot/Image.gz-dtb" \
+            --output boot-archimedes-pure-32MiB.img
+          if [ -f "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" ]; then
+            python3 tools/package_archimedes_boot.py \
+              --template tools/archimedes-boot-template-32MiB.img \
+              --kernel "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" \
+              --output boot-archimedes-kernelsu-32MiB.img
+          fi
+          sha256sum boot-archimedes-*-32MiB.img
+
+      - name: Upload pure artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archimedes-pure-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            boot-archimedes-pure-32MiB.img
+            ${{ runner.temp }}/archimedes-pure/BUILD-INFO.txt
+
+      - name: Upload KernelSU artifacts
+        if: ${{ hashFiles('drivers/kernelsu/Kconfig') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: archimedes-kernelsu-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            boot-archimedes-kernelsu-32MiB.img
+            ${{ runner.temp }}/archimedes-ksu/BUILD-INFO.txt
