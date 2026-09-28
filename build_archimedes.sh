@@ -76,7 +76,7 @@ fi
   printf 'build_timestamp=%s\n' "$KBUILD_BUILD_TIMESTAMP"
   printf 'cross_compile=%s\n' "$CROSS_COMPILE"
   git -C "$ROOT" rev-parse HEAD 2>/dev/null | sed 's/^/source_commit=/' || printf 'source_commit=archive\n'
-  "${MAKE[@]}" -s kernelrelease | sed 's/^/kernelrelease=/'
+  "${MAKE[@]}" LOCALVERSION="$LOCALVERSION" -s kernelrelease | sed 's/^/kernelrelease=/'
   sha256sum "$OUT/arch/arm64/boot/Image.gz-dtb" | sed 's# .*#  Image.gz-dtb#'
 } > "$OUT/BUILD-INFO.txt"
 
