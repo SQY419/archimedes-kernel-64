@@ -8,9 +8,9 @@ OUT=${OUT:-"$ROOT/out-archimedes-$VARIANT"}
 CROSS_COMPILE=${CROSS_COMPILE:-aarch64-linux-gnu-}
 HOSTCFLAGS=${HOSTCFLAGS:--fcommon}
 HOSTCXXFLAGS=${HOSTCXXFLAGS:--fcommon}
-LOCALVERSION=${LOCALVERSION:--agui@caner.center}
+LOCALVERSION=${LOCALVERSION:--agui@caner}
 KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-agui}
-KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-caner.center}
+KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-caner}
 if [[ -z "${KBUILD_BUILD_TIMESTAMP:-}" ]]; then
   if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
     KBUILD_BUILD_TIMESTAMP=$(date -u -d "@${SOURCE_DATE_EPOCH}" '+%a %b %d %H:%M:%S UTC %Y')
