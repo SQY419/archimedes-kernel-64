@@ -2,6 +2,16 @@ name: Archimedes kernel builds
 
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Kernel variant to build (auto follows the selected branch)
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - pure
+          - kernelsu
   push:
     branches: [main, kernelsu]
 
@@ -11,11 +21,20 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      # Pushes follow their branch. Manual runs default to the selected branch,
+      # while an explicit input can override it.
+      BUILD_VARIANT: ${{ (github.event_name == 'workflow_dispatch' && inputs.variant != 'auto' && inputs.variant) || (github.ref_name == 'kernelsu' && 'kernelsu') || 'pure' }}
+      JOBS: 24
+      KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Show build selection
+        run: echo "Building $BUILD_VARIANT from $GITHUB_REF_NAME"
 
       - name: Install toolchain
         run: |
@@ -25,40 +44,45 @@ jobs:
             python3 cpio
 
       - name: Build pure kernel
+        if: ${{ env.BUILD_VARIANT == 'pure' }}
         env:
-          JOBS: 24
           OUT: ${{ runner.temp }}/archimedes-pure
-          KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
         run: ./build_archimedes.sh pure
 
       - name: Build KernelSU kernel
-        if: ${{ hashFiles('drivers/kernelsu/Kconfig') != '' }}
+        if: ${{ env.BUILD_VARIANT == 'kernelsu' }}
         env:
-          JOBS: 24
           OUT: ${{ runner.temp }}/archimedes-ksu
-          KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
         run: ./build_archimedes.sh ksu
 
-      - name: Package boot images
+      - name: Package pure boot image
+        if: ${{ env.BUILD_VARIANT == 'pure' }}
         env:
-          PURE_OUT: ${{ runner.temp }}/archimedes-pure
-          KSU_OUT: ${{ runner.temp }}/archimedes-ksu
+          OUT: ${{ runner.temp }}/archimedes-pure
         run: |
           test -f package_archimedes_boot.py
           python3 -m py_compile package_archimedes_boot.py
           python3 package_archimedes_boot.py \
             --template tools/archimedes-boot-template-32MiB.img \
-            --kernel "$PURE_OUT/arch/arm64/boot/Image.gz-dtb" \
+            --kernel "$OUT/arch/arm64/boot/Image.gz-dtb" \
             --output boot-archimedes-pure-32MiB.img
-          if [ -f "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" ]; then
-            python3 package_archimedes_boot.py \
-              --template tools/archimedes-boot-template-32MiB.img \
-              --kernel "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" \
-              --output boot-archimedes-kernelsu-32MiB.img
-          fi
-          sha256sum boot-archimedes-*-32MiB.img
+          sha256sum boot-archimedes-pure-32MiB.img
+
+      - name: Package KernelSU boot image
+        if: ${{ env.BUILD_VARIANT == 'kernelsu' }}
+        env:
+          OUT: ${{ runner.temp }}/archimedes-ksu
+        run: |
+          test -f package_archimedes_boot.py
+          python3 -m py_compile package_archimedes_boot.py
+          python3 package_archimedes_boot.py \
+            --template tools/archimedes-boot-template-32MiB.img \
+            --kernel "$OUT/arch/arm64/boot/Image.gz-dtb" \
+            --output boot-archimedes-kernelsu-32MiB.img
+          sha256sum boot-archimedes-kernelsu-32MiB.img
 
       - name: Upload pure artifacts
+        if: ${{ env.BUILD_VARIANT == 'pure' }}
         uses: actions/upload-artifact@v4
         with:
           name: archimedes-pure-${{ github.sha }}
@@ -68,7 +92,7 @@ jobs:
             ${{ runner.temp }}/archimedes-pure/BUILD-INFO.txt
 
       - name: Upload KernelSU artifacts
-        if: ${{ hashFiles('drivers/kernelsu/Kconfig') != '' }}
+        if: ${{ env.BUILD_VARIANT == 'kernelsu' }}
         uses: actions/upload-artifact@v4
         with:
           name: archimedes-kernelsu-${{ github.sha }}
