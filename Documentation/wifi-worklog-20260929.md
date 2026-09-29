@@ -15,3 +15,10 @@ The clean module was built with 24 jobs on the Linux sandbox (32 CPUs, 82 GiB RA
 ## Test and rollback
 
 Before testing, the stable module was pulled back to the local artifacts directory. The Android `/vendor` copy was transient, so the candidate was written through TWRP to the actual vendor partition. At the time of recording, the device had not yet reappeared on ADB after the reboot; do not treat the candidate as validated until boot and stress logs are captured.
+
+## 2026-09-29 coherent AXI DMA validation
+
+- WLAN source fix: commit `58c7ba5` (`wifi: allocate reserved AXI memory coherently`).
+- The fix attaches the DT reserved-memory pool, uses `dma_alloc_coherent()` power-of-two segments, and maps them in allocation order.
+- Dynamic module validation: Wi-Fi enabled, DHCP succeeded, 64 MiB download stayed up for 20 s, and 32 concurrent 1 MiB uploads completed without Oops, EMI fault, or `exception reboot`.
+- Patch is preserved as `Documentation/wifi-coherent-dma-58c7ba5.patch`; the WLAN upstream origin denied push permission, so this kernel repository carries the reproducible patch.
