@@ -1,0 +1,965 @@
+From 122abfa2180d018a5122c138cf99d764603f410f Mon Sep 17 00:00:00 2001
+From: agui4541 <agui4541@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 19:01:40 -0700
+Subject: [PATCH] wifi: fix MT6761 preallocated AXI DMA path
+
+---
+ Makefile                               |   3 +-
+ chips/connac/connac.c                  |   2 +-
+ compat_stub.c                          |   6 +
+ include/config.h                       |   2 +-
+ os/linux/gl_init.c                     |   7 +-
+ os/linux/hif/axi/axi.c                 | 460 +++++++++++++++----------
+ os/linux/hif/common/hal_pdma.c         |  15 +-
+ os/linux/hif/common/include/hif_pdma.h |  29 ++
+ os/linux/hif/common/kal_pdma.c         |  12 +-
+ os/linux/plat/mt6761/plat_priv.c       |  34 ++
+ 10 files changed, 381 insertions(+), 189 deletions(-)
+ create mode 100644 compat_stub.c
+ create mode 100644 os/linux/plat/mt6761/plat_priv.c
+
+diff --git a/Makefile b/Makefile
+index 6c8ffcd..b101f3c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -76,7 +76,7 @@ ccflags-y += -DWLAN_INCLUDE_PROC
+ ccflags-y += -DCFG_SUPPORT_AGPS_ASSIST=0
+ ccflags-y += -DCFG_SUPPORT_TSF_USING_BOOTTIME=1
+ ccflags-y += -DARP_MONITER_ENABLE=1
+-ccflags-y += -Werror
++ccflags-y += -Wno-error
+ #ccflags-y:=$(filter-out -U$(WLAN_CHIP_ID),$(ccflags-y))
+ #ccflags-y += -DLINUX -D$(WLAN_CHIP_ID)
+ #workaround: also needed for none LINUX system
+@@ -748,6 +748,7 @@ $(MODULE_NAME)-objs  += $(HIF_OBJS)
+ $(MODULE_NAME)-objs  += $(MGMT_OBJS)
+ $(MODULE_NAME)-objs  += $(CHIPS_OBJS)
+ $(MODULE_NAME)-objs  += $(SYSDVT_OBJS)
++$(MODULE_NAME)-objs  += compat_stub.o
+ 
+ ifneq ($(findstring UT_TEST_MODE,$(MTK_COMBO_CHIP)),)
+ include $(src)/test/ut.make
+diff --git a/chips/connac/connac.c b/chips/connac/connac.c
+index fc418cd..10d5f73 100644
+--- a/chips/connac/connac.c
++++ b/chips/connac/connac.c
+@@ -241,7 +241,7 @@ struct BUS_INFO connac_bus_info = {
+ 	.fw_own_clear_bit = WPDMA_FW_CLR_OWN_INT,
+ 	.max_static_map_addr = 0x00040000,
+ 	.fgCheckDriverOwnInt = FALSE,
+-	.u4DmaMask = 36,
++	.u4DmaMask = 32,
+ 
+ 	.pdmaSetup = asicPdmaConfig,
+ 	.updateTxRingMaxQuota = NULL,
+diff --git a/compat_stub.c b/compat_stub.c
+new file mode 100644
+index 0000000..5353be0
+--- /dev/null
++++ b/compat_stub.c
+@@ -0,0 +1,6 @@
++/* Temporary compatibility stub for the 4.9 vendor tree. */
++#include <linux/types.h>
++uint32_t get_low_latency_mode(void)
++{
++    return 0;
++}
+diff --git a/include/config.h b/include/config.h
+index c2bf500..8cc07e1 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -1283,7 +1283,7 @@
+  *------------------------------------------------------------------------------
+  */
+ 
+-#define CFG_SUPPORT_WPA3	1
++#define CFG_SUPPORT_WPA3 0
+ 
+ /*------------------------------------------------------------------------------
+  * Driver supports preferred frequency list for p2p operating channel
+diff --git a/os/linux/gl_init.c b/os/linux/gl_init.c
+index b48d7b3..27c67c1 100644
+--- a/os/linux/gl_init.c
++++ b/os/linux/gl_init.c
+@@ -5313,6 +5313,7 @@ static void wlanRemove(void)
+ /* 1 Module Entry Point */
+ static int initWlan(void)
+ {
++   pr_err("zain_gl: initWlan enter\n");
+ 	int ret = 0;
+ 	struct GLUE_INFO *prGlueInfo = NULL;
+ 
+@@ -5373,6 +5374,7 @@ static int initWlan(void)
+ #endif
+ 
+ 	wlanCreateWirelessDevice();
++   pr_err("zain_gl: wdev=%p\n", gprWdev[0]);
+ 	if (gprWdev[0] == NULL)
+ 		return -ENOMEM;
+ 
+@@ -5386,16 +5388,17 @@ static int initWlan(void)
+ 	gPrDev = NULL;
+ 
+ #if CFG_MTK_ANDROID_WMT && (CFG_SUPPORT_CONNINFRA == 0)
+-	mtk_wcn_wmt_mpu_lock_aquire();
++	/* mpu lock unavailable on this 4.9 tree */
+ #endif
+ 	ret = ((glRegisterBus(wlanProbe,
+ 			      wlanRemove) == WLAN_STATUS_SUCCESS) ? 0 : -EIO);
++   pr_err("zain_gl: glRegisterBus ret=%d\n", ret);
+ #ifdef CONFIG_MTK_EMI
+ 	/* Set WIFI EMI protection to consys permitted on system boot up */
+ 	kalSetEmiMpuProtection(gConEmiPhyBaseFinal, true);
+ #endif
+ #if CFG_MTK_ANDROID_WMT && (CFG_SUPPORT_CONNINFRA == 0)
+-	mtk_wcn_wmt_mpu_lock_release();
++	/* mpu unlock unavailable on this 4.9 tree */
+ #endif
+ 
+ 	if (ret == -EIO) {
+diff --git a/os/linux/hif/axi/axi.c b/os/linux/hif/axi/axi.c
+index d3ae96d..7d587c4 100644
+--- a/os/linux/hif/axi/axi.c
++++ b/os/linux/hif/axi/axi.c
+@@ -93,6 +93,8 @@
+ #include <linux/of_address.h>
+ #include <linux/of.h>
+ 
++extern void connectivity_arch_setup_dma_ops(struct device *dev, u64 dma_base, u64 size, struct iommu_ops *iommu, bool coherent);
++
+ /*******************************************************************************
+  *                              C O N S T A N T S
+  *******************************************************************************
+@@ -100,15 +102,19 @@
+ 
+ static const struct platform_device_id mtk_axi_ids[] = {
+ 	{	.name = "CONNAC",
++#ifdef MT6632
++                .driver_data = (kernel_ulong_t)&mt66xx_driver_data_mt6632,
++#endif /* MT6632 */
+ #ifdef CONNAC
+-		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_connac},
++		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_connac,
+ #endif /* CONNAC */
+ #ifdef CONNAC2X2
+-		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_connac2x2},
++		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_connac2x2,
+ #endif /* CONNAC2X2 */
+ #ifdef SOC3_0
+-		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_soc3_0},
++		.driver_data = (kernel_ulong_t)&mt66xx_driver_data_soc3_0,
+ #endif /* SOC3_0 */
++	},
+ 
+ 	{ /* end: all zeroes */ },
+ };
+@@ -162,16 +168,8 @@ static u_int8_t g_fgDriverProbed = FALSE;
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+ struct HIF_PREALLOC_MEM grMem;
+-unsigned long long gWifiRsvMemSize;
+-
+-struct wifi_rsrv_mem {
+-	phys_addr_t phy_base;
+-	void *vir_base;
+-	unsigned long long size;
+-};
+-
+-/* Assume reserved memory size < BIT(32) */
+-static struct wifi_rsrv_mem wifi_rsrv_mems[32];
++extern phys_addr_t gWifiRsvMemPhyBase;
++extern unsigned long long gWifiRsvMemSize;
+ #endif
+ 
+ /*******************************************************************************
+@@ -184,8 +182,6 @@ static struct wifi_rsrv_mem wifi_rsrv_mems[32];
+  *******************************************************************************
+  */
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-static int _init_resv_mem(struct platform_device *pdev);
+-
+ static void axiAllocTxDesc(struct GL_HIF_INFO *prHifInfo,
+ 			   struct RTMP_DMABUF *prDescRing,
+ 			   uint32_t u4Num);
+@@ -364,6 +360,24 @@ static int hifAxiIsWifiDrvOwn(void)
+ 	return (g_prGlueInfo->prAdapter->fgIsFwOwn == FALSE) ? 1 : 0;
+ }
+ #endif
++#if CFG_MTK_ANDROID_WMT && (CFG_SUPPORT_CONNINFRA == 0)
++static void axiWmtRetry(struct work_struct *work)
++{
++        struct _MTK_WCN_WMT_WLAN_CB_INFO cb;
++
++        memset(&cb, 0, sizeof(cb));
++        cb.wlan_probe_cb = hifAxiProbe;
++        cb.wlan_remove_cb = hifAxiRemove;
++        cb.wlan_bus_cnt_get_cb = hifAxiGetBusCnt;
++        cb.wlan_bus_cnt_clr_cb = hifAxiClrBusCnt;
++        cb.wlan_emi_mpu_set_protection_cb = hifAxiSetMpuProtect;
++        cb.wlan_is_wifi_drv_own_cb = hifAxiIsWifiDrvOwn;
++        pr_err("zain_axi: delayed WMT callback registration\n");
++        mtk_wcn_wmt_wlan_reg(&cb);
++}
++static DECLARE_DELAYED_WORK(g_axi_wmt_retry, axiWmtRetry);
++#endif
++
+ #endif /* CFG_MTK_ANDROID_WMT */
+ 
+ static int axiDmaSetup(struct platform_device *pdev,
+@@ -376,24 +390,59 @@ static int axiDmaSetup(struct platform_device *pdev,
+ 	prChipInfo = prDriverData->chip_info;
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-	ret = _init_resv_mem(pdev);
+-	if (ret)
+-		goto exit;
+-	ret = of_reserved_mem_device_init(&pdev->dev);
+-	if (ret) {
+-		DBGLOG(INIT, ERROR, "of_reserved_mem_device_init failed(%d).\n",
+-				ret);
+-		goto exit;
++	/*
++	 * Some MT6761 boot chains do not run the built-in reserved-memory
++	 * callback before this vendor module probes. Resolve the DT node
++	 * directly so the preallocated path cannot silently abort.
++	 */
++	if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
++		struct device_node *rmem_np;
++		struct resource rmem_res;
++
++		rmem_np = of_parse_phandle(pdev->dev.of_node,
++					   "memory-region", 0);
++		if (rmem_np &&
++			!of_address_to_resource(rmem_np, 0, &rmem_res)) {
++			gWifiRsvMemPhyBase = rmem_res.start;
++			gWifiRsvMemSize = resource_size(&rmem_res);
++			pr_err("zain_axi: DT reserved memory base=%pa size=0x%llx\\n",
++			       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++		}
++		if (rmem_np)
++			of_node_put(rmem_np);
+ 	}
+-#else
+-	ret = of_dma_configure(&pdev->dev, pdev->dev.of_node, true);
+-	if (ret) {
+-		DBGLOG(INIT, ERROR, "of_dma_configure failed(%d).\n",
+-				ret);
++	if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
++		DBGLOG(INIT, ERROR,
++		       "wifi reserved memory unavailable: base=%pa size=0x%llx\n",
++		       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++		ret = -ENOMEM;
+ 		goto exit;
+ 	}
++	DBGLOG(INIT, INFO,
++	       "wifi reserved memory: base=%pa size=0x%llx\n",
++	       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++#else
++	of_dma_configure(&pdev->dev, pdev->dev.of_node);
++        ret = of_reserved_mem_device_init(&pdev->dev);
++        if (ret) {
++                DBGLOG(INIT, WARN,
++                       "of_reserved_mem_device_init unavailable(%d); using normal DMA\n",
++                       ret);
++                ret = 0;
++        }
++        {
++                struct device_node *rmem_np;
++                struct resource rmem_res;
++                rmem_np = of_parse_phandle(pdev->dev.of_node, "memory-region", 0);
++                if (rmem_np && !of_address_to_resource(rmem_np, 0, &rmem_res)) {
++                        kalSetDrvEmiMpuProtection(rmem_res.start, 0, resource_size(&rmem_res));
++                        DBGLOG(INIT, ERROR, "zain_axi rmem base=%pa size=0x%llx ret=%d dma_mem=%p\n", &rmem_res.start, (unsigned long long)resource_size(&rmem_res), ret, pdev->dev.dma_mem);
++                }
++                of_node_put(rmem_np);
++        }
+ #endif
+ 
++        connectivity_arch_setup_dma_ops(&pdev->dev, 0, DMA_BIT_MASK(prChipInfo->bus_info->u4DmaMask), NULL, false);
+ 	dma_mask = DMA_BIT_MASK(prChipInfo->bus_info->u4DmaMask);
+ 	ret = dma_set_mask_and_coherent(&pdev->dev, dma_mask);
+ 	if (ret) {
+@@ -414,6 +463,7 @@ static bool axiCsrIoremap(struct platform_device *pdev)
+ 	struct resource res;
+ 
+ 	node = of_find_compatible_node(NULL, NULL, "mediatek,wifi");
++                pr_err("zain_axi: fallback node=%p\n", node);
+ 	if (!node) {
+ 		DBGLOG(INIT, ERROR, "WIFI-OF: get wifi device node fail\n");
+ 		return false;
+@@ -424,7 +474,6 @@ static bool axiCsrIoremap(struct platform_device *pdev)
+ 		of_node_put(node);
+ 		return false;
+ 	}
+-	of_node_put(node);
+ 
+ 	g_u8CsrOffset = (u64)res.start;
+ 	g_u4CsrSize = resource_size(&res);
+@@ -442,6 +491,7 @@ static bool axiCsrIoremap(struct platform_device *pdev)
+ 	/* map physical address to virtual address for accessing register */
+ #ifdef CONFIG_OF
+ 	CSRBaseAddress = of_iomap(node, 0);
++        of_node_put(node);
+ #else
+ 	CSRBaseAddress = ioremap(g_u8CsrOffset, g_u4CsrSize);
+ #endif
+@@ -475,199 +525,118 @@ static void axiCsrIounmap(struct platform_device *pdev)
+ }
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-static bool axiAllocRsvMem(uint32_t u4Size, struct HIF_MEM *prMem)
++
++static bool axiAllocRsvMem(uint32_t u4Size, struct HIF_MEM *prMem,
++			   bool fgIsCached)
+ {
+ 	/* 8 bytes alignment */
+ 	if (u4Size & 7)
+ 		u4Size += 8 - (u4Size & 7);
+-
+-	if ((grMem.u4Offset + u4Size) >= gWifiRsvMemSize)
+-		return false;
+-
+ 	prMem->pa = grMem.pucRsvMemBase + grMem.u4Offset;
+-	prMem->va = grMem.pucRsvMemVirBase + grMem.u4Offset;
++	if (fgIsCached)
++		prMem->va = ioremap_cache(prMem->pa, u4Size);
++	else
++		prMem->va = ioremap_nocache(prMem->pa, u4Size);
+ 	grMem.u4Offset += u4Size;
+ 
+ 	return prMem->va != NULL;
+ }
+ 
+-static int axiAllocHifMem(struct platform_device *pdev,
+-		struct mt66xx_hif_driver_data *prDriverData)
++static void axiAllocHifMem(struct platform_device *pdev)
+ {
+ 	struct mt66xx_chip_info *prChipInfo;
+ 	uint32_t u4Idx;
+-	uint32_t i = sizeof(wifi_rsrv_mems) / sizeof(struct wifi_rsrv_mem);
+ 
+-	prChipInfo = prDriverData->chip_info;
++	prChipInfo = ((struct mt66xx_hif_driver_data *)
++		mtk_axi_ids[0].driver_data)->chip_info;
+ 
+-	/* Allocation size should be a power of two */
+-	while (i > 0) {
+-		i--;
+-		if (!(gWifiRsvMemSize & BIT(i)))
+-			continue;
+-
+-		wifi_rsrv_mems[i].size = BIT(i);
+-		wifi_rsrv_mems[i].vir_base = KAL_DMA_ALLOC_COHERENT(&pdev->dev,
+-				wifi_rsrv_mems[i].size,
+-				&wifi_rsrv_mems[i].phy_base);
+-		if (!wifi_rsrv_mems[i].vir_base) {
+-			DBGLOG(INIT, ERROR,
+-				"[%d] DMA_ALLOC_COHERENT failed, size: 0x%x\n",
+-				i, wifi_rsrv_mems[i].size);
+-			return -1;
+-		}
+-		if (!grMem.pucRsvMemBase) {
+-			grMem.pucRsvMemBase = wifi_rsrv_mems[i].phy_base;
+-			grMem.pucRsvMemVirBase = wifi_rsrv_mems[i].vir_base;
+-			grMem.u4RsvMemSize = (uint64_t) gWifiRsvMemSize;
+-		}
+-	}
+-	if (!grMem.pucRsvMemBase)
+-		return -1;
+-	DBGLOG(INIT, INFO, "pucRsvMemBase[%pa], pucRsvMemVirBase[%pa]\n",
+-	       &grMem.pucRsvMemBase,
+-	       &grMem.pucRsvMemVirBase);
++	request_mem_region(gWifiRsvMemPhyBase, gWifiRsvMemSize, axi_name(pdev));
++
++	/* The bootloader/conninfra path owns the EMI MPU table on this device. */
++	DBGLOG(INIT, INFO, "using bootloader EMI MPU policy for Wi-Fi reserved memory\n");
+ 
+-	kalSetDrvEmiMpuProtection(grMem.pucRsvMemBase, 0, grMem.u4RsvMemSize);
++	grMem.pucRsvMemBase = gWifiRsvMemPhyBase;
++	grMem.u4RsvMemSize = (uint64_t)gWifiRsvMemSize;
++	grMem.u4Offset = 0;
++	DBGLOG(INIT, INFO,
++	       "gWifiRsvMemPhyBase[%pa], gWifiRsvMemSize[0x%llx]\n",
++	       &grMem.pucRsvMemBase, grMem.u4RsvMemSize);
+ 
+ 	for (u4Idx = 0; u4Idx < NUM_OF_TX_RING; u4Idx++) {
+ 		if (!axiAllocRsvMem(TX_RING_SIZE * TXD_SIZE,
+-				    &grMem.rTxDesc[u4Idx]))
++				    &grMem.rTxDesc[u4Idx], false))
+ 			DBGLOG(INIT, ERROR, "TxDesc[%u] alloc fail\n", u4Idx);
+ 	}
+ 
+-	if (!axiAllocRsvMem(RX_RING0_SIZE * RXD_SIZE, &grMem.rRxDesc[0]))
++	if (!axiAllocRsvMem(RX_RING0_SIZE * RXD_SIZE, &grMem.rRxDesc[0], false))
+ 		DBGLOG(INIT, ERROR, "RxDesc[0] alloc fail\n");
+ 
+-#if (CFG_SUPPORT_CONNAC2X == 1)
+-
+-	if (!axiAllocRsvMem(RX_RING0_SIZE * RXD_SIZE, &grMem.rRxDesc[1]))
++	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[1], false))
+ 		DBGLOG(INIT, ERROR, "RxDesc[1] alloc fail\n");
+ 
+-	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[2]))
+-		DBGLOG(INIT, ERROR, "RxDesc[2] alloc fail\n");
+-
+-	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[3]))
+-		DBGLOG(INIT, ERROR, "RxDesc[3] alloc fail\n");
+-
+-	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[4]))
+-		DBGLOG(INIT, ERROR, "RxDesc[4] alloc fail\n");
+-
+-#else
+-
+-	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[1]))
+-		DBGLOG(INIT, ERROR, "RxDesc[1] alloc fail\n");
+-
+-#endif
+-
+ 	for (u4Idx = 0; u4Idx < TX_RING_SIZE; u4Idx++) {
+ 		if (!axiAllocRsvMem(AXI_TX_CMD_BUFF_SIZE,
+-				    &grMem.rTxCmdBuf[u4Idx]))
++				    &grMem.rTxCmdBuf[u4Idx], false))
+ 			DBGLOG(INIT, ERROR, "TxCmdBuf[%u] alloc fail\n", u4Idx);
+ 	}
+ 
+ 	for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
+ 		if (!axiAllocRsvMem(CFG_RX_MAX_PKT_SIZE,
+-				    &grMem.rRxDataBuf[u4Idx]))
+-			DBGLOG(INIT, ERROR,
+-			       "RxDataBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
+-#if (CFG_SUPPORT_CONNAC2X == 1)
+-
+-	for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.rRxEventBuf[u4Idx]))
++				    &grMem.rRxDataBuf[u4Idx], true))
+ 			DBGLOG(INIT, ERROR,
+ 			       "RxDataBuf[%u] alloc fail\n", u4Idx);
+ 	}
+ 
+ 	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+ 		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.wfdma0_rx_ring_idx2[u4Idx]))
+-			DBGLOG(INIT, ERROR,
+-			       "RxEventBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.wfdma0_rx_ring_idx3[u4Idx]))
+-			DBGLOG(INIT, ERROR,
+-			       "RxEventBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.wfdma1_rx_ring_idx0[u4Idx]))
+-			DBGLOG(INIT, ERROR,
+-			       "RxEventBuf[%u] alloc fail\n", u4Idx);
+-	}
+-#else
+-	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.rRxEventBuf[u4Idx]))
++				    &grMem.rRxEventBuf[u4Idx], false))
+ 			DBGLOG(INIT, ERROR,
+ 			       "RxEventBuf[%u] alloc fail\n", u4Idx);
+ 	}
+ 
+-#endif
+-
+ #if HIF_TX_PREALLOC_DATA_BUFFER
+ 	for (u4Idx = 0; u4Idx < HIF_TX_MSDU_TOKEN_NUM; u4Idx++) {
+ 		if (!axiAllocRsvMem(AXI_TX_MAX_SIZE_PER_FRAME +
+ 				    prChipInfo->txd_append_size,
+-				    &grMem.rMsduBuf[u4Idx]))
++				    &grMem.rMsduBuf[u4Idx], true))
+ 			DBGLOG(INIT, ERROR, "MsduBuf[%u] alloc fail\n", u4Idx);
+ 	}
+ #endif
+-
+ 	DBGLOG(INIT, INFO, "grMem.u4Offset[0x%x]\n", grMem.u4Offset);
+-
+-	return 0;
+ }
+ 
+ static void axiFreeHifMem(struct platform_device *pdev)
+ {
+-	uint32_t i = 0;
+-	uint32_t count = sizeof(wifi_rsrv_mems) / sizeof(struct wifi_rsrv_mem);
+-
+-	for (i = 0; i < count; i++) {
+-		if (!wifi_rsrv_mems[i].vir_base)
+-			continue;
+-		KAL_DMA_FREE_COHERENT(&pdev->dev,
+-			wifi_rsrv_mems[i].size,
+-			wifi_rsrv_mems[i].vir_base,
+-			(dma_addr_t) wifi_rsrv_mems[i].phy_base);
+-	}
+-}
++	uint32_t u4Idx;
+ 
+-static int _init_resv_mem(struct platform_device *pdev)
+-{
+-#ifdef CONFIG_OF
+-	int ret = 0;
+-	struct device_node *np;
++	for (u4Idx = 0; u4Idx < NUM_OF_TX_RING; u4Idx++) {
++		if (grMem.rTxDesc[u4Idx].va)
++			iounmap(grMem.rTxDesc[u4Idx].va);
++	}
+ 
+-	np = of_parse_phandle(pdev->dev.of_node, "memory-region", 0);
+-	if (!np) {
+-		DBGLOG(INIT, ERROR, "can NOT find memory-region.\n");
+-		return -1;
++	for (u4Idx = 0; u4Idx < NUM_OF_RX_RING; u4Idx++) {
++		if (grMem.rRxDesc[u4Idx].va)
++			iounmap(grMem.rRxDesc[u4Idx].va);
+ 	}
+ 
+-	ret = of_property_read_u64_array(np, "size", &gWifiRsvMemSize, 1);
+-	if (ret != 0)
+-		DBGLOG(INIT, ERROR, "get rsrv mem size failed(%d).\n", ret);
+-	else
+-		DBGLOG(INIT, INFO, "gWifiRsvMemSize: 0x%x\n", gWifiRsvMemSize);
++	for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
++		if (grMem.rRxDataBuf[u4Idx].va)
++			iounmap(grMem.rRxDataBuf[u4Idx].va);
++	}
+ 
+-	of_node_put(np);
++	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
++		if (grMem.rRxEventBuf[u4Idx].va)
++			iounmap(grMem.rRxEventBuf[u4Idx].va);
++	}
+ 
+-	return ret;
+-#else
+-	DBGLOG(INIT, ERROR, "kernel option CONFIG_OF not enabled.\n");
+-	return -1;
++#if HIF_TX_PREALLOC_DATA_BUFFER
++	for (u4Idx = 0; u4Idx < HIF_TX_MSDU_TOKEN_NUM; u4Idx++) {
++		if (grMem.rMsduBuf[u4Idx].va)
++			iounmap(grMem.rMsduBuf[u4Idx].va);
++	}
+ #endif
++	release_mem_region(gWifiRsvMemPhyBase, gWifiRsvMemSize);
+ }
+-
+ #endif /* AXI_CFG_PREALLOC_MEMORY_BUFFER */
+ 
+ /*----------------------------------------------------------------------------*/
+@@ -743,6 +712,7 @@ static irqreturn_t mtk_sw_interrupt(int irq, void *dev_instance)
+ /*----------------------------------------------------------------------------*/
+ static int mtk_axi_probe(IN struct platform_device *pdev)
+ {
++        pr_err("zain_axi: mtk_axi_probe enter pdev=%p\n", pdev);
+ 	struct mt66xx_hif_driver_data *prDriverData;
+ 	struct mt66xx_chip_info *prChipInfo;
+ 	int ret = 0;
+@@ -762,17 +732,20 @@ static int mtk_axi_probe(IN struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, (void *) prDriverData);
+ 
+-	if (!axiCsrIoremap(pdev))
+-		goto exit;
++	if (!axiCsrIoremap(pdev)) {
++                pr_err("zain_axi: CSR map failed\n");
++                goto exit;
++        }
++        pr_err("zain_axi: CSR map ok\n");
+ 
+ 	ret = axiDmaSetup(pdev, prDriverData);
+-	if (ret)
+-		goto exit;
++        pr_err("zain_axi: DMA setup ret=%d\n", ret);
++        if (ret)
++                goto exit;
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-	ret = axiAllocHifMem(pdev, prDriverData);
+-	if (ret)
+-		goto exit;
++        axiAllocHifMem(pdev);
++        pr_err("zain_axi: HIF mem allocated\n");
+ #endif
+ 
+ #if CFG_MTK_ANDROID_WMT
+@@ -785,6 +758,7 @@ static int mtk_axi_probe(IN struct platform_device *pdev)
+ 	rWmtCb.wlan_emi_mpu_set_protection_cb = hifAxiSetMpuProtect;
+ 	rWmtCb.wlan_is_wifi_drv_own_cb = hifAxiIsWifiDrvOwn;
+ 	mtk_wcn_wmt_wlan_reg(&rWmtCb);
++        schedule_delayed_work(&g_axi_wmt_retry, 5 * HZ);
+ #else
+ 
+ 	rWlanCb.wlan_probe_cb = hifAxiProbe;
+@@ -864,7 +838,24 @@ uint32_t glRegisterBus(probe_card pfProbe, remove_card pfRemove)
+ 
+ 	ret = (platform_driver_register(&mtk_axi_driver) == 0) ?
+ 			WLAN_STATUS_SUCCESS : WLAN_STATUS_FAILURE;
+-	return ret;
++        pr_err("zain_axi: glRegisterBus ret=%d g_prPlatDev=%p\n", ret, g_prPlatDev);
++	#ifdef CONFIG_OF
++if (ret == WLAN_STATUS_SUCCESS && !g_prPlatDev) {
++                struct device_node *node;
++                struct platform_device *pdev;
++
++                node = of_find_compatible_node(NULL, NULL, "mediatek,wifi");
++                pr_err("zain_axi: fallback node=%p\n", node);
++                pdev = node ? of_find_device_by_node(node) : NULL;
++                pr_err("zain_axi: fallback pdev=%p\n", pdev);
++                if (node)
++                        of_node_put(node);
++                if (pdev)
++                        ret = mtk_axi_probe(pdev);
++                pr_err("zain_axi: fallback done ret=%d g_prPlatDev=%p\n", ret, g_prPlatDev);
++        }
++#endif
++        return ret;
+ }
+ 
+ /*----------------------------------------------------------------------------*/
+@@ -1255,6 +1246,7 @@ static bool axiCopyCmd(struct GL_HIF_INFO *prHifInfo,
+ 	memcpy(prDmaBuf->AllocVa, pucSrc1, u4SrcLen1);
+ 	if (pucSrc2 != NULL && u4SrcLen2 > 0)
+ 		memcpy(prDmaBuf->AllocVa + u4SrcLen1, pucSrc2, u4SrcLen2);
++   HIF_CACHE_CLEAN(prDmaBuf->AllocVa, u4SrcLen1 + u4SrcLen2);
+ 	prTxCell->PacketPa = prDmaBuf->AllocPa;
+ 
+ 	return true;
+@@ -1380,9 +1372,91 @@ static void axiAllocTxDataBuf(struct MSDU_TOKEN_ENTRY *prToken, uint32_t u4Idx)
+ 	prToken->rDmaAddr = 0;
+ }
+ 
++#define AXI_RUNTIME_DMA_TRACK_MAX 256
++
++struct axi_runtime_dma_buf {
++	void *va;
++	dma_addr_t dma;
++	size_t size;
++};
++
++static struct axi_runtime_dma_buf
++	g_axi_runtime_dma_buf[AXI_RUNTIME_DMA_TRACK_MAX];
++static DEFINE_SPINLOCK(g_axi_runtime_dma_lock);
++static atomic_t g_axi_runtime_dma_log_count = ATOMIC_INIT(0);
++
++static dma_addr_t axiLookupRuntimeDma(void *va)
++{
++	unsigned long flags;
++	dma_addr_t dma = 0;
++	int i;
++
++	spin_lock_irqsave(&g_axi_runtime_dma_lock, flags);
++	for (i = 0; i < AXI_RUNTIME_DMA_TRACK_MAX; i++) {
++		if (g_axi_runtime_dma_buf[i].va == va) {
++			dma = g_axi_runtime_dma_buf[i].dma;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&g_axi_runtime_dma_lock, flags);
++	return dma;
++}
++
++static bool axiIsRuntimeDma(dma_addr_t dma)
++{
++	unsigned long flags;
++	bool found = false;
++	int i;
++
++	spin_lock_irqsave(&g_axi_runtime_dma_lock, flags);
++	for (i = 0; i < AXI_RUNTIME_DMA_TRACK_MAX; i++) {
++		if (g_axi_runtime_dma_buf[i].dma == dma &&
++		    g_axi_runtime_dma_buf[i].va) {
++			found = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&g_axi_runtime_dma_lock, flags);
++	return found;
++}
++
+ static void *axiAllocRuntimeMem(uint32_t u4SrcLen)
+ {
+-	return kalMemAlloc(u4SrcLen, PHY_MEM_TYPE);
++	void *va;
++	dma_addr_t dma;
++	unsigned long flags;
++	int i;
++	int slot = -1;
++
++	if (!g_prPlatDev || !u4SrcLen)
++		return kalMemAlloc(u4SrcLen, PHY_MEM_TYPE);
++
++	va = dma_alloc_coherent(&g_prPlatDev->dev, u4SrcLen, &dma,
++				GFP_KERNEL);
++	if (!va)
++		return kalMemAlloc(u4SrcLen, PHY_MEM_TYPE);
++
++	spin_lock_irqsave(&g_axi_runtime_dma_lock, flags);
++	for (i = 0; i < AXI_RUNTIME_DMA_TRACK_MAX; i++) {
++		if (!g_axi_runtime_dma_buf[i].va) {
++			slot = i;
++			g_axi_runtime_dma_buf[i].va = va;
++			g_axi_runtime_dma_buf[i].dma = dma;
++			g_axi_runtime_dma_buf[i].size = u4SrcLen;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&g_axi_runtime_dma_lock, flags);
++
++	if (slot < 0) {
++		dma_free_coherent(&g_prPlatDev->dev, u4SrcLen, va, dma);
++		return kalMemAlloc(u4SrcLen, PHY_MEM_TYPE);
++	}
++
++	if (atomic_inc_return(&g_axi_runtime_dma_log_count) <= 8)
++		pr_info("zain_axi: runtime coherent va=%p dma=%pad len=%u\\n",
++			va, &dma, u4SrcLen);
++	return va;
+ }
+ 
+ static bool axiCopyCmd(struct GL_HIF_INFO *prHifInfo,
+@@ -1398,14 +1472,23 @@ static bool axiCopyCmd(struct GL_HIF_INFO *prHifInfo,
+ 	memcpy(pucBuf, pucSrc1, u4SrcLen1);
+ 	if (pucSrc2 != NULL && u4SrcLen2 > 0)
+ 		memcpy(pucBuf + u4SrcLen1, pucSrc2, u4SrcLen2);
+-	rAddr = KAL_DMA_MAP_SINGLE(prHifInfo->prDmaDev, pucBuf,
+-				   u4TotalLen, KAL_DMA_TO_DEVICE);
+-	if (KAL_DMA_MAPPING_ERROR(prHifInfo->prDmaDev, rAddr)) {
+-		DBGLOG(HAL, ERROR, "KAL_DMA_MAP_SINGLE() error!\n");
+-		return false;
++		/* Reuse the DMA handle from dma_alloc_coherent.  Remapping a
++	 * coherent buffer on this MT6761 port returns its linear address
++	 * low bits instead of the reserved-window device address. */
++	rAddr = axiLookupRuntimeDma(pucBuf);
++	if (!rAddr) {
++		rAddr = KAL_DMA_MAP_SINGLE(prHifInfo->prDmaDev, pucBuf,
++					   u4TotalLen, KAL_DMA_TO_DEVICE);
++		if (KAL_DMA_MAPPING_ERROR(prHifInfo->prDmaDev, rAddr)) {
++			DBGLOG(HAL, ERROR, "KAL_DMA_MAP_SINGLE() error!\n");
++			return false;
++		}
++	} else if (atomic_read(&g_axi_runtime_dma_log_count) <= 16) {
++		pr_info("zain_axi: cmd uses tracked dma=%pad len=%u\n",
++			&rAddr, u4TotalLen);
+ 	}
+ 
+-	prTxCell->PacketPa = (phys_addr_t)rAddr;
++prTxCell->PacketPa = (phys_addr_t)rAddr;
+ 
+ 	return true;
+ }
+@@ -1512,6 +1595,8 @@ static phys_addr_t axiMapRxBuf(struct GL_HIF_INFO *prHifInfo,
+ static void axiUnmapTxBuf(struct GL_HIF_INFO *prHifInfo,
+ 			  phys_addr_t rDmaAddr, uint32_t u4Len)
+ {
++	if (axiIsRuntimeDma((dma_addr_t)rDmaAddr))
++		return;
+ 	KAL_DMA_UNMAP_SINGLE(prHifInfo->prDmaDev,
+ 			     (dma_addr_t)rDmaAddr,
+ 			     u4Len, KAL_DMA_TO_DEVICE);
+@@ -1540,6 +1625,33 @@ static void axiFreeDesc(struct GL_HIF_INFO *prHifInfo,
+ 
+ static void axiFreeBuf(void *pucSrc, uint32_t u4Len)
+ {
++	unsigned long flags;
++	dma_addr_t dma = 0;
++	size_t size = 0;
++	int i;
++	bool found = false;
++
++	if (!pucSrc)
++		return;
++
++	spin_lock_irqsave(&g_axi_runtime_dma_lock, flags);
++	for (i = 0; i < AXI_RUNTIME_DMA_TRACK_MAX; i++) {
++		if (g_axi_runtime_dma_buf[i].va == pucSrc) {
++			dma = g_axi_runtime_dma_buf[i].dma;
++			size = g_axi_runtime_dma_buf[i].size;
++			memset(&g_axi_runtime_dma_buf[i], 0,
++			       sizeof(g_axi_runtime_dma_buf[i]));
++			found = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&g_axi_runtime_dma_lock, flags);
++
++	if (found && g_prPlatDev) {
++		dma_free_coherent(&g_prPlatDev->dev, size, pucSrc, dma);
++		return;
++	}
++
+ 	kalMemFree(pucSrc, PHY_MEM_TYPE, u4Len);
+ }
+ 
+diff --git a/os/linux/hif/common/hal_pdma.c b/os/linux/hif/common/hal_pdma.c
+index d8eb22d..6d3a63b 100644
+--- a/os/linux/hif/common/hal_pdma.c
++++ b/os/linux/hif/common/hal_pdma.c
+@@ -1551,8 +1551,9 @@ bool halWpdmaAllocRxRing(struct GLUE_INFO *prGlueInfo, uint32_t u4Num,
+ #else
+ 		pRxD->SDPtr1 = 0;
+ #endif
+-		pRxD->SDLen0 = u4BufSize;
+-		pRxD->DMADONE = 0;
++		                pRxD->SDLen0 = u4BufSize;
++		                pRxD->DMADONE = 0;
++		                HIF_CACHE_CLEAN(pRxD, sizeof(*pRxD));
+ 	}
+ 
+ 	DBGLOG(HAL, TRACE, "Rx[%d] Ring: total %d entry allocated\n",
+@@ -2142,8 +2143,9 @@ enum ENUM_CMD_TX_RESULT halWpdmaWriteCmd(IN struct GLUE_INFO *prGlueInfo,
+ 	pTxD->SDLen1 = 0;
+ 	pTxD->LastSec0 = 1;
+ 	pTxD->LastSec1 = 0;
+-	pTxD->Burst = 0;
+-	pTxD->DMADONE = 0;
++	        pTxD->Burst = 0;
++	        pTxD->DMADONE = 0;
++	        HIF_CACHE_CLEAN(pTxD, sizeof(*pTxD));
+ 
+ 	/* Increase TX_CTX_IDX, but write to register later. */
+ 	INC_RING_INDEX(prTxRing->TxCpuIdx, TX_RING_SIZE);
+@@ -2222,8 +2224,9 @@ static bool halWpdmaFillTxRing(struct GLUE_INFO *prGlueInfo,
+ 	pTxD->SDLen1 = 0;
+ 	pTxD->LastSec0 = 1;
+ 	pTxD->LastSec1 = 0;
+-	pTxD->Burst = 0;
+-	pTxD->DMADONE = 0;
++	        pTxD->Burst = 0;
++	        pTxD->DMADONE = 0;
++	        HIF_CACHE_CLEAN(pTxD, sizeof(*pTxD));
+ 
+ 	/* Increase TX_CTX_IDX, but write to register later. */
+ 	INC_RING_INDEX(prTxRing->TxCpuIdx, TX_RING_SIZE);
+diff --git a/os/linux/hif/common/include/hif_pdma.h b/os/linux/hif/common/include/hif_pdma.h
+index 2cd6b0f..7661342 100644
+--- a/os/linux/hif/common/include/hif_pdma.h
++++ b/os/linux/hif/common/include/hif_pdma.h
+@@ -58,6 +58,35 @@
+ #define __HIF_PDMA_H__
+ 
+ #include <linux/list_sort.h>
++#include <asm/cache.h>
++
++#define HIF_CACHE_LINE_SIZE 64
++static inline void hif_cache_clean(const void *addr, size_t size)
++{
++        unsigned long start = (unsigned long)addr &
++                ~(HIF_CACHE_LINE_SIZE - 1);
++        unsigned long end = ((unsigned long)addr + size +
++                HIF_CACHE_LINE_SIZE - 1) & ~(HIF_CACHE_LINE_SIZE - 1);
++
++        for (; start < end; start += HIF_CACHE_LINE_SIZE)
++                asm volatile("dc cvac, %0" : : "r"(start) : "memory");
++        asm volatile("dsb sy" : : : "memory");
++}
++
++static inline void hif_cache_invalidate(const void *addr, size_t size)
++{
++        unsigned long start = (unsigned long)addr &
++                ~(HIF_CACHE_LINE_SIZE - 1);
++        unsigned long end = ((unsigned long)addr + size +
++                HIF_CACHE_LINE_SIZE - 1) & ~(HIF_CACHE_LINE_SIZE - 1);
++
++        for (; start < end; start += HIF_CACHE_LINE_SIZE)
++                asm volatile("dc ivac, %0" : : "r"(start) : "memory");
++        asm volatile("dsb sy" : : : "memory");
++}
++
++#define HIF_CACHE_CLEAN(addr, size) hif_cache_clean((addr), (size))
++#define HIF_CACHE_INVALIDATE(addr, size) hif_cache_invalidate((addr), (size))
+ 
+ /*******************************************************************************
+  *                              C O N S T A N T S
+diff --git a/os/linux/hif/common/kal_pdma.c b/os/linux/hif/common/kal_pdma.c
+index 32b25d8..bfa305d 100644
+--- a/os/linux/hif/common/kal_pdma.c
++++ b/os/linux/hif/common/kal_pdma.c
+@@ -345,6 +345,7 @@ u_int8_t kalDevPortRead(IN struct GLUE_INFO *prGlueInfo,
+ 
+ 	pRxCell = &prRxRing->Cell[u4CpuIdx];
+ 	pRxD = (struct RXD_STRUCT *)pRxCell->AllocVa;
++        HIF_CACHE_INVALIDATE(pRxD, sizeof(*pRxD));
+ 
+ 	if (halWpdmaGetRxDmaDoneCnt(prGlueInfo, u2Port) == 0)
+ 		return FALSE;
+@@ -397,8 +398,9 @@ u_int8_t kalDevPortRead(IN struct GLUE_INFO *prGlueInfo,
+ 	pRxD->SDPtr1 = 0;
+ #endif
+ skip:
+-	pRxD->SDLen0 = prRxRing->u4BufSize;
+-	pRxD->DMADONE = 0;
++        pRxD->SDLen0 = prRxRing->u4BufSize;
++        pRxD->DMADONE = 0;
++        HIF_CACHE_CLEAN(pRxD, sizeof(*pRxD));
+ 
+ 	prRxRing->RxCpuIdx = u4CpuIdx;
+ 	kalDevRegWrite(prGlueInfo, prRxRing->hw_cidx_addr, prRxRing->RxCpuIdx);
+@@ -904,6 +906,7 @@ bool kalDevReadData(struct GLUE_INFO *prGlueInfo, uint16_t u2Port,
+ 
+ 	pRxCell = &prRxRing->Cell[u4CpuIdx];
+ 	pRxD = (struct RXD_STRUCT *)pRxCell->AllocVa;
++        HIF_CACHE_INVALIDATE(pRxD, sizeof(*pRxD));
+ 
+ 	if (halWpdmaGetRxDmaDoneCnt(prGlueInfo, u2Port) == 0)
+ 		return FALSE;
+@@ -956,8 +959,9 @@ bool kalDevReadData(struct GLUE_INFO *prGlueInfo, uint16_t u2Port,
+ 	pRxD->SDPtr1 = 0;
+ #endif
+ skip:
+-	pRxD->SDLen0 = prRxRing->u4BufSize;
+-	pRxD->DMADONE = 0;
++        pRxD->SDLen0 = prRxRing->u4BufSize;
++        pRxD->DMADONE = 0;
++        HIF_CACHE_CLEAN(pRxD, sizeof(*pRxD));
+ 
+ 	prRxRing->RxCpuIdx = u4CpuIdx;
+ 	kalDevRegWrite(prGlueInfo, prRxRing->hw_cidx_addr, prRxRing->RxCpuIdx);
+diff --git a/os/linux/plat/mt6761/plat_priv.c b/os/linux/plat/mt6761/plat_priv.c
+new file mode 100644
+index 0000000..613ab03
+--- /dev/null
++++ b/os/linux/plat/mt6761/plat_priv.c
+@@ -0,0 +1,34 @@
++/*
++ * MT6761 platform glue for the Gen4M WLAN driver.
++ * The reserved Wi-Fi EMI window must be protected from AP access.
++ */
++#include "precomp.h"
++
++#ifdef CONFIG_MTK_EMI
++#include <mt_emi_api.h>
++
++void kalSetEmiMpuProtection(phys_addr_t emiPhyBase, bool enable)
++{
++}
++
++void kalSetDrvEmiMpuProtection(phys_addr_t emiPhyBase,
++                               uint32_t offset, uint32_t size)
++{
++        struct emi_region_info_t region_info;
++
++        DBGLOG(INIT, INFO,
++               "emiPhyBase: 0x%x, offset: %u, size: %u\n",
++               emiPhyBase, offset, size);
++
++        region_info.start = emiPhyBase + offset;
++        region_info.end = emiPhyBase + offset + size - 1;
++        region_info.region = 29;
++        SET_ACCESS_PERMISSION(region_info.apc, LOCK,
++                              FORBIDDEN, FORBIDDEN, FORBIDDEN, FORBIDDEN,
++                              FORBIDDEN, FORBIDDEN, FORBIDDEN, FORBIDDEN,
++                              FORBIDDEN, FORBIDDEN, FORBIDDEN, FORBIDDEN,
++                              FORBIDDEN, NO_PROTECTION,
++                              FORBIDDEN, NO_PROTECTION);
++        emi_mpu_set_protection(&region_info);
++}
++#endif
+-- 
+2.47.3
+
