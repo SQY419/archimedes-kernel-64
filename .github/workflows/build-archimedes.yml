@@ -44,12 +44,14 @@ jobs:
           PURE_OUT: ${{ runner.temp }}/archimedes-pure
           KSU_OUT: ${{ runner.temp }}/archimedes-ksu
         run: |
-          python3 tools/package_archimedes_boot.py \
+          test -f package_archimedes_boot.py
+          python3 -m py_compile package_archimedes_boot.py
+          python3 package_archimedes_boot.py \
             --template tools/archimedes-boot-template-32MiB.img \
             --kernel "$PURE_OUT/arch/arm64/boot/Image.gz-dtb" \
             --output boot-archimedes-pure-32MiB.img
           if [ -f "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" ]; then
-            python3 tools/package_archimedes_boot.py \
+            python3 package_archimedes_boot.py \
               --template tools/archimedes-boot-template-32MiB.img \
               --kernel "$KSU_OUT/arch/arm64/boot/Image.gz-dtb" \
               --output boot-archimedes-kernelsu-32MiB.img
