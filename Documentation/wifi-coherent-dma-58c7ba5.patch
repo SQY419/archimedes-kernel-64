@@ -1,0 +1,366 @@
+From 58c7ba5542462b339ff51982a400520e44d428ed Mon Sep 17 00:00:00 2001
+From: agui4541 <agui@caner>
+Date: Mon, 28 Sep 2026 23:36:45 -0700
+Subject: [PATCH] wifi: allocate reserved AXI memory coherently
+
+---
+ os/linux/hif/axi/axi.c | 309 ++++++++++++++++++++++++-----------------
+ 1 file changed, 178 insertions(+), 131 deletions(-)
+
+diff --git a/os/linux/hif/axi/axi.c b/os/linux/hif/axi/axi.c
+index 7d587c4..963c262 100644
+--- a/os/linux/hif/axi/axi.c
++++ b/os/linux/hif/axi/axi.c
+@@ -170,6 +170,18 @@ static u_int8_t g_fgDriverProbed = FALSE;
+ struct HIF_PREALLOC_MEM grMem;
+ extern phys_addr_t gWifiRsvMemPhyBase;
+ extern unsigned long long gWifiRsvMemSize;
++
++/* The MT6761 reserved-memory node is a shared DMA pool.  Do not ioremap
++ * this DRAM and use the returned address as normal memory: on arm64 that
++ * produces an I/O mapping which is not safe for descriptor memset/DMA.
++ * Keep one coherent allocation per power-of-two segment instead. */
++struct wifi_rsrv_mem {
++        phys_addr_t phy_base;
++        void *vir_base;
++        unsigned long long size;
++};
++
++static struct wifi_rsrv_mem wifi_rsrv_mems[32];
+ #endif
+ 
+ /*******************************************************************************
+@@ -390,37 +402,40 @@ static int axiDmaSetup(struct platform_device *pdev,
+ 	prChipInfo = prDriverData->chip_info;
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-	/*
+-	 * Some MT6761 boot chains do not run the built-in reserved-memory
+-	 * callback before this vendor module probes. Resolve the DT node
+-	 * directly so the preallocated path cannot silently abort.
+-	 */
+-	if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
+-		struct device_node *rmem_np;
+-		struct resource rmem_res;
+-
+-		rmem_np = of_parse_phandle(pdev->dev.of_node,
+-					   "memory-region", 0);
+-		if (rmem_np &&
+-			!of_address_to_resource(rmem_np, 0, &rmem_res)) {
+-			gWifiRsvMemPhyBase = rmem_res.start;
+-			gWifiRsvMemSize = resource_size(&rmem_res);
+-			pr_err("zain_axi: DT reserved memory base=%pa size=0x%llx\\n",
+-			       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
+-		}
+-		if (rmem_np)
+-			of_node_put(rmem_np);
+-	}
+-	if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
+-		DBGLOG(INIT, ERROR,
+-		       "wifi reserved memory unavailable: base=%pa size=0x%llx\n",
+-		       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
+-		ret = -ENOMEM;
+-		goto exit;
+-	}
+-	DBGLOG(INIT, INFO,
+-	       "wifi reserved memory: base=%pa size=0x%llx\n",
+-	       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++        /* Resolve the DT node for diagnostics and for the DMA-pool binding. */
++        if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
++                struct device_node *rmem_np;
++                struct resource rmem_res;
++
++                rmem_np = of_parse_phandle(pdev->dev.of_node,
++                                           "memory-region", 0);
++                if (rmem_np &&
++                        !of_address_to_resource(rmem_np, 0, &rmem_res)) {
++                        gWifiRsvMemPhyBase = rmem_res.start;
++                        gWifiRsvMemSize = resource_size(&rmem_res);
++                        pr_err("zain_axi: DT reserved memory base=%pa size=0x%llx\n",
++                               &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++                }
++                if (rmem_np)
++                        of_node_put(rmem_np);
++        }
++        if (!gWifiRsvMemPhyBase || !gWifiRsvMemSize) {
++                DBGLOG(INIT, ERROR,
++                       "wifi reserved memory unavailable: base=%pa size=0x%llx\n",
++                       &gWifiRsvMemPhyBase, gWifiRsvMemSize);
++                ret = -ENOMEM;
++                goto exit;
++        }
++        /* Attach the platform device to the DT reserved-memory DMA pool. */
++        ret = of_reserved_mem_device_init(&pdev->dev);
++        if (ret) {
++                DBGLOG(INIT, ERROR,
++                       "of_reserved_mem_device_init failed(%d)\n", ret);
++                goto exit;
++        }
++        DBGLOG(INIT, INFO,
++               "wifi reserved memory: base=%pa size=0x%llx, coherent DMA pool attached\n",
++               &gWifiRsvMemPhyBase, gWifiRsvMemSize);
+ #else
+ 	of_dma_configure(&pdev->dev, pdev->dev.of_node);
+         ret = of_reserved_mem_device_init(&pdev->dev);
+@@ -526,117 +541,147 @@ static void axiCsrIounmap(struct platform_device *pdev)
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+ 
++static void axiFreeHifMem(struct platform_device *pdev);
++
+ static bool axiAllocRsvMem(uint32_t u4Size, struct HIF_MEM *prMem,
+-			   bool fgIsCached)
++                           bool fgIsCached)
+ {
+-	/* 8 bytes alignment */
+-	if (u4Size & 7)
+-		u4Size += 8 - (u4Size & 7);
+-	prMem->pa = grMem.pucRsvMemBase + grMem.u4Offset;
+-	if (fgIsCached)
+-		prMem->va = ioremap_cache(prMem->pa, u4Size);
+-	else
+-		prMem->va = ioremap_nocache(prMem->pa, u4Size);
+-	grMem.u4Offset += u4Size;
++        uint64_t off, cursor = 0;
++        uint32_t i;
++
++        (void)fgIsCached;
++        /* 8 bytes alignment */
++        if (u4Size & 7)
++                u4Size += 8 - (u4Size & 7);
++
++        off = grMem.u4Offset;
++        for (i = ARRAY_SIZE(wifi_rsrv_mems); i > 0; i--) {
++                uint32_t idx = i - 1;
++                unsigned long long seg = wifi_rsrv_mems[idx].size;
++                uint64_t local;
++
++                if (!seg || !wifi_rsrv_mems[idx].vir_base)
++                        continue;
++                if (off >= cursor + seg) {
++                        cursor += seg;
++                        continue;
++                }
++                local = off - cursor;
++                if (local + u4Size > seg) {
++                        cursor += seg;
++                        continue;
++                }
++                prMem->pa = wifi_rsrv_mems[idx].phy_base + local;
++                prMem->va = (char *)wifi_rsrv_mems[idx].vir_base + local;
++                grMem.u4Offset = off + u4Size;
++                return true;
++        }
+ 
+-	return prMem->va != NULL;
++        prMem->pa = 0;
++        prMem->va = NULL;
++        return false;
+ }
+ 
+-static void axiAllocHifMem(struct platform_device *pdev)
++static int axiAllocHifMem(struct platform_device *pdev)
+ {
+-	struct mt66xx_chip_info *prChipInfo;
+-	uint32_t u4Idx;
+-
+-	prChipInfo = ((struct mt66xx_hif_driver_data *)
+-		mtk_axi_ids[0].driver_data)->chip_info;
+-
+-	request_mem_region(gWifiRsvMemPhyBase, gWifiRsvMemSize, axi_name(pdev));
+-
+-	/* The bootloader/conninfra path owns the EMI MPU table on this device. */
+-	DBGLOG(INIT, INFO, "using bootloader EMI MPU policy for Wi-Fi reserved memory\n");
+-
+-	grMem.pucRsvMemBase = gWifiRsvMemPhyBase;
+-	grMem.u4RsvMemSize = (uint64_t)gWifiRsvMemSize;
+-	grMem.u4Offset = 0;
+-	DBGLOG(INIT, INFO,
+-	       "gWifiRsvMemPhyBase[%pa], gWifiRsvMemSize[0x%llx]\n",
+-	       &grMem.pucRsvMemBase, grMem.u4RsvMemSize);
+-
+-	for (u4Idx = 0; u4Idx < NUM_OF_TX_RING; u4Idx++) {
+-		if (!axiAllocRsvMem(TX_RING_SIZE * TXD_SIZE,
+-				    &grMem.rTxDesc[u4Idx], false))
+-			DBGLOG(INIT, ERROR, "TxDesc[%u] alloc fail\n", u4Idx);
+-	}
+-
+-	if (!axiAllocRsvMem(RX_RING0_SIZE * RXD_SIZE, &grMem.rRxDesc[0], false))
+-		DBGLOG(INIT, ERROR, "RxDesc[0] alloc fail\n");
+-
+-	if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[1], false))
+-		DBGLOG(INIT, ERROR, "RxDesc[1] alloc fail\n");
+-
+-	for (u4Idx = 0; u4Idx < TX_RING_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(AXI_TX_CMD_BUFF_SIZE,
+-				    &grMem.rTxCmdBuf[u4Idx], false))
+-			DBGLOG(INIT, ERROR, "TxCmdBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(CFG_RX_MAX_PKT_SIZE,
+-				    &grMem.rRxDataBuf[u4Idx], true))
+-			DBGLOG(INIT, ERROR,
+-			       "RxDataBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+-		if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
+-				    &grMem.rRxEventBuf[u4Idx], false))
+-			DBGLOG(INIT, ERROR,
+-			       "RxEventBuf[%u] alloc fail\n", u4Idx);
+-	}
+-
++        struct mt66xx_chip_info *prChipInfo;
++        uint32_t u4Idx;
++        uint32_t i;
++
++        prChipInfo = ((struct mt66xx_hif_driver_data *)
++                mtk_axi_ids[0].driver_data)->chip_info;
++        memset(&grMem, 0, sizeof(grMem));
++        memset(wifi_rsrv_mems, 0, sizeof(wifi_rsrv_mems));
++
++        /* Split the reserved size into power-of-two coherent DMA segments. */
++        for (i = ARRAY_SIZE(wifi_rsrv_mems); i > 0; i--) {
++                uint32_t bit = i - 1;
++                unsigned long long size;
++
++                if (!(gWifiRsvMemSize & BIT(bit)))
++                        continue;
++                size = BIT(bit);
++                wifi_rsrv_mems[bit].size = size;
++                wifi_rsrv_mems[bit].vir_base =
++                        KAL_DMA_ALLOC_COHERENT(&pdev->dev, size,
++                                               &wifi_rsrv_mems[bit].phy_base);
++                if (!wifi_rsrv_mems[bit].vir_base) {
++                        DBGLOG(INIT, ERROR,
++                               "[%u] DMA_ALLOC_COHERENT failed, size: 0x%llx\n",
++                               bit, size);
++                        axiFreeHifMem(pdev);
++                        return -ENOMEM;
++                }
++                if (!grMem.pucRsvMemBase) {
++                        grMem.pucRsvMemBase = wifi_rsrv_mems[bit].phy_base;
++                        grMem.pucRsvMemVirBase = wifi_rsrv_mems[bit].vir_base;
++                }
++        }
++        grMem.u4RsvMemSize = (uint64_t)gWifiRsvMemSize;
++        if (!grMem.pucRsvMemBase)
++                return -ENOMEM;
++
++        DBGLOG(INIT, INFO,
++               "coherent Wi-Fi memory base[%pa] virt[%p] size[0x%llx]\n",
++               &grMem.pucRsvMemBase, grMem.pucRsvMemVirBase,
++               grMem.u4RsvMemSize);
++        kalSetDrvEmiMpuProtection(grMem.pucRsvMemBase, 0,
++                                  grMem.u4RsvMemSize);
++
++        for (u4Idx = 0; u4Idx < NUM_OF_TX_RING; u4Idx++) {
++                if (!axiAllocRsvMem(TX_RING_SIZE * TXD_SIZE,
++                                    &grMem.rTxDesc[u4Idx], false))
++                        DBGLOG(INIT, ERROR, "TxDesc[%u] alloc fail\n", u4Idx);
++        }
++        if (!axiAllocRsvMem(RX_RING0_SIZE * RXD_SIZE, &grMem.rRxDesc[0], false))
++                DBGLOG(INIT, ERROR, "RxDesc[0] alloc fail\n");
++        if (!axiAllocRsvMem(RX_RING1_SIZE * RXD_SIZE, &grMem.rRxDesc[1], false))
++                DBGLOG(INIT, ERROR, "RxDesc[1] alloc fail\n");
++        for (u4Idx = 0; u4Idx < TX_RING_SIZE; u4Idx++) {
++                if (!axiAllocRsvMem(AXI_TX_CMD_BUFF_SIZE,
++                                    &grMem.rTxCmdBuf[u4Idx], false))
++                        DBGLOG(INIT, ERROR, "TxCmdBuf[%u] alloc fail\n", u4Idx);
++        }
++        for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
++                if (!axiAllocRsvMem(CFG_RX_MAX_PKT_SIZE,
++                                    &grMem.rRxDataBuf[u4Idx], true))
++                        DBGLOG(INIT, ERROR, "RxDataBuf[%u] alloc fail\n", u4Idx);
++        }
++        for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
++                if (!axiAllocRsvMem(RX_BUFFER_AGGRESIZE,
++                                    &grMem.rRxEventBuf[u4Idx], false))
++                        DBGLOG(INIT, ERROR, "RxEventBuf[%u] alloc fail\n", u4Idx);
++        }
+ #if HIF_TX_PREALLOC_DATA_BUFFER
+-	for (u4Idx = 0; u4Idx < HIF_TX_MSDU_TOKEN_NUM; u4Idx++) {
+-		if (!axiAllocRsvMem(AXI_TX_MAX_SIZE_PER_FRAME +
+-				    prChipInfo->txd_append_size,
+-				    &grMem.rMsduBuf[u4Idx], true))
+-			DBGLOG(INIT, ERROR, "MsduBuf[%u] alloc fail\n", u4Idx);
+-	}
++        for (u4Idx = 0; u4Idx < HIF_TX_MSDU_TOKEN_NUM; u4Idx++) {
++                if (!axiAllocRsvMem(AXI_TX_MAX_SIZE_PER_FRAME +
++                                    prChipInfo->txd_append_size,
++                                    &grMem.rMsduBuf[u4Idx], true))
++                        DBGLOG(INIT, ERROR, "MsduBuf[%u] alloc fail\n", u4Idx);
++        }
+ #endif
+-	DBGLOG(INIT, INFO, "grMem.u4Offset[0x%x]\n", grMem.u4Offset);
++        DBGLOG(INIT, INFO, "grMem.u4Offset[0x%x]\n", grMem.u4Offset);
++        return 0;
+ }
+ 
+ static void axiFreeHifMem(struct platform_device *pdev)
+ {
+-	uint32_t u4Idx;
+-
+-	for (u4Idx = 0; u4Idx < NUM_OF_TX_RING; u4Idx++) {
+-		if (grMem.rTxDesc[u4Idx].va)
+-			iounmap(grMem.rTxDesc[u4Idx].va);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < NUM_OF_RX_RING; u4Idx++) {
+-		if (grMem.rRxDesc[u4Idx].va)
+-			iounmap(grMem.rRxDesc[u4Idx].va);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING0_SIZE; u4Idx++) {
+-		if (grMem.rRxDataBuf[u4Idx].va)
+-			iounmap(grMem.rRxDataBuf[u4Idx].va);
+-	}
+-
+-	for (u4Idx = 0; u4Idx < RX_RING1_SIZE; u4Idx++) {
+-		if (grMem.rRxEventBuf[u4Idx].va)
+-			iounmap(grMem.rRxEventBuf[u4Idx].va);
+-	}
+-
+-#if HIF_TX_PREALLOC_DATA_BUFFER
+-	for (u4Idx = 0; u4Idx < HIF_TX_MSDU_TOKEN_NUM; u4Idx++) {
+-		if (grMem.rMsduBuf[u4Idx].va)
+-			iounmap(grMem.rMsduBuf[u4Idx].va);
+-	}
+-#endif
+-	release_mem_region(gWifiRsvMemPhyBase, gWifiRsvMemSize);
++        uint32_t i;
++
++        for (i = 0; i < ARRAY_SIZE(wifi_rsrv_mems); i++) {
++                if (!wifi_rsrv_mems[i].vir_base)
++                        continue;
++                KAL_DMA_FREE_COHERENT(&pdev->dev,
++                                      wifi_rsrv_mems[i].size,
++                                      wifi_rsrv_mems[i].vir_base,
++                                      (dma_addr_t)wifi_rsrv_mems[i].phy_base);
++                wifi_rsrv_mems[i].vir_base = NULL;
++                wifi_rsrv_mems[i].phy_base = 0;
++                wifi_rsrv_mems[i].size = 0;
++        }
++        memset(&grMem, 0, sizeof(grMem));
+ }
++
+ #endif /* AXI_CFG_PREALLOC_MEMORY_BUFFER */
+ 
+ /*----------------------------------------------------------------------------*/
+@@ -744,8 +789,10 @@ static int mtk_axi_probe(IN struct platform_device *pdev)
+                 goto exit;
+ 
+ #if AXI_CFG_PREALLOC_MEMORY_BUFFER
+-        axiAllocHifMem(pdev);
+-        pr_err("zain_axi: HIF mem allocated\n");
++        ret = axiAllocHifMem(pdev);
++        pr_err("zain_axi: HIF mem allocated ret=%d\n", ret);
++        if (ret)
++                goto exit;
+ #endif
+ 
+ #if CFG_MTK_ANDROID_WMT
+-- 
+2.47.3
+
