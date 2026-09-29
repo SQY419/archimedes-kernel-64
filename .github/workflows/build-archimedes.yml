@@ -47,13 +47,17 @@ jobs:
         if: ${{ env.BUILD_VARIANT == 'pure' }}
         env:
           OUT: ${{ runner.temp }}/archimedes-pure
-        run: ./build_archimedes.sh pure
+        run: |
+          ./build_archimedes.sh pure
+          test "$(grep -c '^CONFIG_KSU=y' "$OUT/.config")" -eq 0
 
       - name: Build KernelSU kernel
         if: ${{ env.BUILD_VARIANT == 'kernelsu' }}
         env:
           OUT: ${{ runner.temp }}/archimedes-ksu
-        run: ./build_archimedes.sh ksu
+        run: |
+          ./build_archimedes.sh ksu
+          grep -q '^CONFIG_KSU=y' "$OUT/.config"
 
       - name: Package pure boot image
         if: ${{ env.BUILD_VARIANT == 'pure' }}

@@ -55,13 +55,17 @@ MAKE=(make -C "$ROOT" O="$OUT" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE"
   HOSTCFLAGS="$HOSTCFLAGS" HOSTCXXFLAGS="$HOSTCXXFLAGS")
 "${MAKE[@]}" "$DEFCONFIG"
 
+CONFIG_TOOL="$OUT/scripts/config"
+[[ -x "$CONFIG_TOOL" ]] || CONFIG_TOOL="$ROOT/scripts/config"
+[[ -x "$CONFIG_TOOL" ]] || die 'scripts/config was not built'
 if [[ "$VARIANT" = ksu ]]; then
-  CONFIG_TOOL="$OUT/scripts/config"
-  [[ -x "$CONFIG_TOOL" ]] || CONFIG_TOOL="$ROOT/scripts/config"
-  [[ -x "$CONFIG_TOOL" ]] || die 'scripts/config was not built'
   "$CONFIG_TOOL" --file "$OUT/.config" --enable CONFIG_KSU
-  "${MAKE[@]}" olddefconfig
+else
+  # Keep the pure branch genuinely free of KernelSU even if the shared defconfig
+  # or a stale configuration enables it by default.
+  "$CONFIG_TOOL" --file "$OUT/.config" --disable CONFIG_KSU
 fi
+"${MAKE[@]}" olddefconfig
 
 "${MAKE[@]}" LOCALVERSION="$LOCALVERSION" KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
   KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
