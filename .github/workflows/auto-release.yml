@@ -1,0 +1,82 @@
+name: Archimedes automatic release
+
+on:
+  workflow_run:
+    workflows: [Archimedes kernel builds]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed build run ID to publish (optional backfill)
+        required: false
+        type: string
+      release_id:
+        description: Explicit release ID; use the same value for pure and kernelsu
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: >-
+      ${{ (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.head_branch == 'main' ||
+        github.event.workflow_run.head_branch == 'kernelsu'))) }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      MANUAL_RELEASE_ID: ${{ inputs.release_id }}
+    steps:
+      - name: Resolve release identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          message="$(gh api "repos/$REPOSITORY/commits/$HEAD_SHA" --jq '.commit.message')"
+          release_id="$MANUAL_RELEASE_ID"
+          if [[ -z "$release_id" ]]; then
+            release_id="$(printf '%s\n' "$message" | sed -nE 's/^Release-ID:[[:space:]]*//p' | head -n1)"
+          fi
+          if [[ -z "$release_id" ]]; then
+            release_id="sha-${HEAD_SHA:0:12}"
+          fi
+          # Tags and release names must be safe and deterministic.
+          release_id="$(printf '%s' "$release_id" | tr -cs '[:alnum:]._-' '-' | sed -E 's/^-+//; s/-+$//')"
+          [[ -n "$release_id" ]] || release_id="sha-${HEAD_SHA:0:12}"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "tag=auto-$release_id" >> "$GITHUB_OUTPUT"
+          echo "Resolved release ID: $release_id"
+
+      - name: Download build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          gh run download "$RUN_ID" --repo "$REPOSITORY" --dir dist
+          test -n "$(find dist -type f -print -quit)"
+          find dist -type f -maxdepth 4 -print
+
+      - name: Create or update release
+        env:
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$REPOSITORY" \
+              --title "Archimedes $RELEASE_ID" \
+              --notes "Automated build for $RELEASE_ID.\n\nBranch: $HEAD_BRANCH\nCommit: $HEAD_SHA\nBuild run: https://github.com/$REPOSITORY/actions/runs/$RUN_ID"
+          fi
+          mapfile -t files < <(find dist -type f -print)
+          gh release upload "$TAG" "${files[@]}" --repo "$REPOSITORY" --clobber
