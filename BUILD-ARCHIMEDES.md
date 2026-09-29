@@ -18,7 +18,7 @@ The known-good MTK v1 boot header and display DTB are checked in as
 `tools/archimedes-boot-template-32MiB.img`. Package either build with:
 
 ```sh
-python3 tools/package_archimedes_boot.py \
+python3 package_archimedes_boot.py \
   --template tools/archimedes-boot-template-32MiB.img \
   --kernel out-archimedes-pure/arch/arm64/boot/Image.gz-dtb \
   --output boot-archimedes-pure-32MiB.img
