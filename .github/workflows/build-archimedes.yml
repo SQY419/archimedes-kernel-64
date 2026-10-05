@@ -12,8 +12,9 @@ on:
           - auto
           - pure
           - kernelsu
+          - resukisu
   push:
-    branches: [main, kernelsu]
+    branches: [main, kernelsu, resukisu]
 
 permissions:
   contents: read
@@ -24,7 +25,7 @@ jobs:
     env:
       # Pushes follow their branch. Manual runs default to the selected branch,
       # while an explicit input can override it.
-      BUILD_VARIANT: ${{ (github.event_name == 'workflow_dispatch' && inputs.variant != 'auto' && inputs.variant) || (github.ref_name == 'kernelsu' && 'kernelsu') || 'pure' }}
+      BUILD_VARIANT: ${{ (github.event_name == 'workflow_dispatch' && inputs.variant != 'auto' && inputs.variant) || (github.ref_name == 'kernelsu' && 'kernelsu') || (github.ref_name == 'resukisu' && 'resukisu') || 'pure' }}
       JOBS: 24
       KBUILD_BUILD_TIMESTAMP: 2026-09-28T00:00:00Z
     steps:
@@ -59,6 +60,16 @@ jobs:
           ./build_archimedes.sh ksu
           grep -q '^CONFIG_KSU=y' "$OUT/.config"
 
+      - name: Build ReSukiSU kernel
+        if: ${{ env.BUILD_VARIANT == 'resukisu' }}
+        env:
+          OUT: ${{ runner.temp }}/archimedes-resukisu
+        run: |
+          ./build_archimedes.sh resukisu
+          grep -q '^CONFIG_KSU=y' "$OUT/.config"
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' "$OUT/.config"
+          test "$(grep -c '^CONFIG_KSU_TRACEPOINT_HOOK=y' "$OUT/.config")" -eq 0
+
       - name: Package pure boot image
         if: ${{ env.BUILD_VARIANT == 'pure' }}
         env:
@@ -85,6 +96,19 @@ jobs:
             --output boot-archimedes-kernelsu-32MiB.img
           sha256sum boot-archimedes-kernelsu-32MiB.img
 
+      - name: Package ReSukiSU boot image
+        if: ${{ env.BUILD_VARIANT == 'resukisu' }}
+        env:
+          OUT: ${{ runner.temp }}/archimedes-resukisu
+        run: |
+          test -f package_archimedes_boot.py
+          python3 -m py_compile package_archimedes_boot.py
+          python3 package_archimedes_boot.py \
+            --template tools/archimedes-boot-template-32MiB.img \
+            --kernel "$OUT/arch/arm64/boot/Image.gz-dtb" \
+            --output boot-archimedes-resukisu-32MiB.img
+          sha256sum boot-archimedes-resukisu-32MiB.img
+
       - name: Upload pure artifacts
         if: ${{ env.BUILD_VARIANT == 'pure' }}
         uses: actions/upload-artifact@v4
@@ -104,3 +128,13 @@ jobs:
           path: |
             boot-archimedes-kernelsu-32MiB.img
             ${{ runner.temp }}/archimedes-ksu/BUILD-INFO.txt
+
+      - name: Upload ReSukiSU artifacts
+        if: ${{ env.BUILD_VARIANT == 'resukisu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: archimedes-resukisu-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            boot-archimedes-resukisu-32MiB.img
+            ${{ runner.temp }}/archimedes-resukisu/BUILD-INFO.txt

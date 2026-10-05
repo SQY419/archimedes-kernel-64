@@ -34,7 +34,12 @@ case "$VARIANT" in
     DEFCONFIG=k61v1_64_archimedes_defconfig
     [[ -f "$ROOT/drivers/kernelsu/Kconfig" ]] || die 'this checkout has no materialized KernelSU tree'
     ;;
-  *) die "usage: $0 pure|ksu" ;;
+  resukisu)
+    DEFCONFIG=k61v1_64_archimedes_defconfig
+    [[ -f "$ROOT/drivers/kernelsu/Kconfig" ]] || die 'this checkout has no materialized ReSukiSU tree'
+    "$ROOT/scripts/verify_resukisu_hooks.sh" || die 'kernel-side ReSukiSU hooks are missing'
+    ;;
+  *) die "usage: $0 pure|ksu|resukisu" ;;
 esac
 
 if [[ "${CLEAN_BUILD:-1}" = 1 ]]; then
@@ -58,13 +63,30 @@ MAKE=(make -C "$ROOT" O="$OUT" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE"
 CONFIG_TOOL="$OUT/scripts/config"
 [[ -x "$CONFIG_TOOL" ]] || CONFIG_TOOL="$ROOT/scripts/config"
 [[ -x "$CONFIG_TOOL" ]] || die 'scripts/config was not built'
-if [[ "$VARIANT" = ksu ]]; then
-  "$CONFIG_TOOL" --file "$OUT/.config" --enable CONFIG_KSU
-else
-  # Keep the pure branch genuinely free of KernelSU even if the shared defconfig
-  # or a stale configuration enables it by default.
-  "$CONFIG_TOOL" --file "$OUT/.config" --disable CONFIG_KSU
-fi
+case "$VARIANT" in
+  ksu)
+    "$CONFIG_TOOL" --file "$OUT/.config" --enable CONFIG_KSU
+    ;;
+  resukisu)
+    # ReSukiSU on 4.9 uses the manually hooked syscall path (the tracepoint hook
+    # needs GKI2/5.10+). KALLSYMS_ALL is required by the driver's own
+    # static_export_check, which otherwise refuses to build.
+    "$CONFIG_TOOL" --file "$OUT/.config" \
+      --enable CONFIG_KSU \
+      --disable CONFIG_KSU_TRACEPOINT_HOOK \
+      --enable CONFIG_KSU_MANUAL_HOOK \
+      --enable CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+      --enable CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+      --enable CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+      --enable CONFIG_KALLSYMS \
+      --enable CONFIG_KALLSYMS_ALL
+    ;;
+  *)
+    # Keep the pure branch genuinely free of KernelSU even if the shared defconfig
+    # or a stale configuration enables it by default.
+    "$CONFIG_TOOL" --file "$OUT/.config" --disable CONFIG_KSU
+    ;;
+esac
 "${MAKE[@]}" olddefconfig
 
 "${MAKE[@]}" LOCALVERSION="$LOCALVERSION" KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
