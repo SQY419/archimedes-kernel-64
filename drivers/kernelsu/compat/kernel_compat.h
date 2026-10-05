@@ -397,6 +397,26 @@ __weak long copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 
     return ret ? -EFAULT : 0;
 }
+
+/*
+ * copy_from_user_nofault() only became available in 5.8
+ * (https://elixir.bootlin.com/linux/v5.8/source/mm/maccess.c). 4.9 kernels do
+ * not export it, and ReSukiSU calls it from runtime/ksud_integration.c, so
+ * provide the equivalent fail-safe read here.
+ */
+__weak long copy_from_user_nofault(void *dst, const void __user *src, size_t size)
+{
+    long ret;
+    mm_segment_t old_fs = get_fs();
+
+    set_fs(USER_DS);
+    pagefault_disable();
+    ret = __copy_from_user_inatomic(dst, src, size);
+    pagefault_enable();
+    set_fs(old_fs);
+
+    return ret ? -EFAULT : 0;
+}
 #endif
 
 #ifndef __nocfi
